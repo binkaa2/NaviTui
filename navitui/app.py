@@ -324,6 +324,8 @@ class NaviTuiApp(KitApp):
         self.player = None
         self.view: str = "all-songs"  # sidebar view id (or "pl:<id>", or "artist:<id>")
         self._songs: list[Song] = []  # the full tracks-pane model
+        self._albums: list[Album] = []
+        self._album_mode = False
         self._playlists: list[Playlist] = []
         self._podcasts: list[tuple[PodcastChannel, list[Song]]] = []  # channels + episodes
         self._stations: list[Song] = []  # internet-radio stations as playable rows
@@ -412,6 +414,7 @@ class NaviTuiApp(KitApp):
         saved_view = state.get("view", "all-songs")
         if (
             saved_view in VIEW_LABELS
+            or saved_view in ("albums", "albums-newest", "albums-starred")
             or saved_view.startswith(("pl:", "podcast:"))
             or saved_view == "radio"
             or (saved_view == "home" and self._home_enabled)
@@ -1160,6 +1163,18 @@ class NaviTuiApp(KitApp):
             row.append(label, style=palette.text)
             options.append(Option(row, id=view_id))
         options.append(Option(Text(" "), disabled=True))
+        options.append(Option(Text(" albums", style=f"bold {palette.dim}"), disabled=True))
+        for album_view, label, glyph in (
+            ("albums", "all albums", "▦"),
+            ("albums-newest", "recently added", "◷"),
+            ("albums-starred", "starred albums", icons.STAR),
+        ):
+            row = Text(no_wrap=True, overflow="ellipsis")
+            row.append(f"{glyph} ", style=palette.yellow if album_view == "albums-starred" else palette.mauve)
+            row.append(label, style=palette.text)
+            options.append(Option(row, id=album_view))
+
+        options.append(Option(Text(" "), disabled=True))
         options.append(Option(Text(" playlists", style=f"bold {palette.dim}"), disabled=True))
         for p in self._playlists:
             row = Text(no_wrap=True, overflow="ellipsis")
@@ -1249,6 +1264,12 @@ class NaviTuiApp(KitApp):
             return f"podcast · {channel.title}" if channel else "podcast"
         if view_id == "radio":
             return "internet radio"
+        if view_id == "albums":
+            return "all albums"
+        if view_id == "albums-newest":
+            return "recently added albums"
+        if view_id == "albums-starred":
+            return "starred albums"
         return VIEW_LABELS.get(view_id, "tracks")
 
     def _view_rows(self, view_id: str) -> list[Song]:
@@ -1259,7 +1280,32 @@ class NaviTuiApp(KitApp):
         cid = view_id.split(":", 1)[1]
         return next((list(eps) for c, eps in self._podcasts if c.id == cid), [])
 
+    def _show_albums(self, albums: list[Album], title: str) -> None:
+        self._album_mode = True
+        self._albums = albums
+        self._songs = []
+        if self._filtering:
+            self._exit_filter()
+        self._clear_selection()
+        panel = self.query_one("#tracks-panel")
+        panel.border_title = title
+        options: list[Option] = []
+        for index, album in enumerate(albums):
+            row = Text(no_wrap=True, overflow="ellipsis")
+            row.append(
+                f" {icons.STAR if album.starred else '·'} ",
+                style=palette.yellow if album.starred else palette.vfaint,
+            )
+            row.append(album.name, style=palette.text)
+            row.append(f"  {album.artist}", style=palette.dim)
+            if album.year:
+                row.append(f" · {album.year}", style=palette.vfaint)
+            row.append(f" · {album.song_count} tracks", style=palette.vfaint)
+            options.append(Option(row, id=f"alb-{index}"))
+        self._fill("#tracks-list", options, "#tracks-panel")
+
     def _show_songs(self, songs: list[Song], title: str) -> None:
+        self._album_mode = False
         self._songs = songs
         # a fresh view supersedes any active filter / selection (the rows
         # changed under both)
@@ -1277,6 +1323,32 @@ class NaviTuiApp(KitApp):
             await self._render_home()
             return
         title = self._tracks_title(view_id)
+
+        if view_id in ("albums", "albums-newest", "albums-starred"):
+            list_type = {
+                "albums": "alphabeticalByName",
+                "albums-newest": "newest",
+                "albums-starred": "starred",
+            }[view_id]
+            cache_key = f"albumview-{view_id}"
+            cached = self.dirs.read_cache(cache_key)
+            if cached:
+                self._show_albums(
+                    [Album.from_dict(a) for a in cached.get("albums", [])],
+                    title,
+                )
+            try:
+                albums = await self.client.get_album_list(list_type, size=500)
+            except Exception as e:
+                self._connection_trouble(e)
+                return
+            self.dirs.write_cache(
+                cache_key,
+                {"albums": [album.to_dict() for album in albums]},
+            )
+            if self.view == view_id:
+                self._show_albums(albums, title)
+            return
 
         if view_id in ("all-songs", "shuffle-all"):
             cache_key, fetch = "all-songs", self.client.get_all_songs
@@ -1443,6 +1515,12 @@ class NaviTuiApp(KitApp):
 
     @on(OptionList.OptionHighlighted, "#tracks-list")
     def _track_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        if self._album_mode:
+            index = event.option_index
+            album = self._albums[index] if index is not None and 0 <= index < len(self._albums) else None
+            if album is not None and album.cover_art:
+                self._load_art(album.cover_art, f"album-{album.id}")
+            return
         if self.player is not None and self.player.active:
             return  # while playing, the cover belongs to the current song
         view = self._tracks_view()
@@ -1453,10 +1531,25 @@ class NaviTuiApp(KitApp):
 
     @on(OptionList.OptionSelected, "#tracks-list")
     def _track_selected(self, event: OptionList.OptionSelected) -> None:
-        view = self._tracks_view()
         idx = event.option_index
+        if self._album_mode:
+            if idx is not None and 0 <= idx < len(self._albums):
+                self._open_album(self._albums[idx])
+            return
+        view = self._tracks_view()
         if idx is not None and 0 <= idx < len(view):
             self._play_songs(view, idx)
+
+    @work(exclusive=True, group="songs")
+    async def _open_album(self, album: Album) -> None:
+        try:
+            songs = await self.client.get_album_songs(album.id)
+        except Exception as e:
+            self._connection_trouble(e)
+            return
+        if self._album_mode and any(item.id == album.id for item in self._albums):
+            self._show_songs(songs, f"{album.name} · {album.artist}")
+            self.query_one("#tracks-list", ClickList).focus()
 
     @on(OptionList.OptionSelected, "#queue-list")
     def _queue_selected(self, event: OptionList.OptionSelected) -> None:
@@ -2770,6 +2863,19 @@ class NaviTuiApp(KitApp):
 
     # ── starring ──────────────────────────────────────────────────────
     def action_star(self) -> None:
+        if self._album_mode:
+            index = self.query_one("#tracks-list", ClickList).highlighted
+            if index is None or not 0 <= index < len(self._albums):
+                return
+            album = self._albums[index]
+            album.starred = not album.starred
+            self._star(album.id, "album", album.starred)
+            self._show_albums(self._albums, self._tracks_title(self.view))
+            self.notify(
+                f"{'starred' if album.starred else 'unstarred'} album: {album.name}",
+                timeout=2,
+            )
+            return
         selected = self._selected_songs()
         if selected and self.focused is not None and self.focused.id == "tracks-list":
             # bulk: star every selected track (idempotent — always set on, so a
